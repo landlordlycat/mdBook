@@ -4,9 +4,10 @@ pub mod fs;
 mod string;
 pub(crate) mod toml_ext;
 use crate::errors::Error;
+use log::error;
+use once_cell::sync::Lazy;
+use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
 use regex::Regex;
-
-use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser, Tag};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -20,9 +21,7 @@ pub use self::string::{
 
 /// Replaces multiple consecutive whitespace characters with a single space character.
 pub fn collapse_whitespace(text: &str) -> Cow<'_, str> {
-    lazy_static! {
-        static ref RE: Regex = Regex::new(r"\s\s+").unwrap();
-    }
+    static RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s\s+").unwrap());
     RE.replace_all(text, " ")
 }
 
@@ -51,9 +50,7 @@ pub fn id_from_content(content: &str) -> String {
     let mut content = content.to_string();
 
     // Skip any tags or html-encoded stuff
-    lazy_static! {
-        static ref HTML: Regex = Regex::new(r"(<.*?>)").unwrap();
-    }
+    static HTML: Lazy<Regex> = Lazy::new(|| Regex::new(r"(<.*?>)").unwrap());
     content = HTML.replace_all(&content, "").into();
     const REPL_SUB: &[&str] = &["&lt;", "&gt;", "&amp;", "&#39;", "&quot;"];
     for sub in REPL_SUB {
@@ -80,7 +77,7 @@ pub fn unique_id_from_content(content: &str, id_counter: &mut HashMap<String, us
     let id_count = id_counter.entry(id.clone()).or_insert(0);
     let unique_id = match *id_count {
         0 => id,
-        id_count => format!("{}-{}", id, id_count),
+        id_count => format!("{id}-{id_count}"),
     };
     *id_count += 1;
     unique_id
@@ -96,10 +93,9 @@ pub fn unique_id_from_content(content: &str, id_counter: &mut HashMap<String, us
 /// None. Ideally, print page links would link to anchors on the print page,
 /// but that is very difficult.
 fn adjust_links<'a>(event: Event<'a>, path: Option<&Path>) -> Event<'a> {
-    lazy_static! {
-        static ref SCHEME_LINK: Regex = Regex::new(r"^[a-z][a-z0-9+.-]*:").unwrap();
-        static ref MD_LINK: Regex = Regex::new(r"(?P<link>.*)\.md(?P<anchor>#.*)?").unwrap();
-    }
+    static SCHEME_LINK: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-z][a-z0-9+.-]*:").unwrap());
+    static MD_LINK: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?P<link>.*)\.md(?P<anchor>#.*)?").unwrap());
 
     fn fix<'a>(dest: CowStr<'a>, path: Option<&Path>) -> CowStr<'a> {
         if dest.starts_with('#') {
@@ -109,7 +105,7 @@ fn adjust_links<'a>(event: Event<'a>, path: Option<&Path>) -> Event<'a> {
                 if base.ends_with(".md") {
                     base.replace_range(base.len() - 3.., ".html");
                 }
-                return format!("{}{}", base, dest).into();
+                return format!("{base}{dest}").into();
             } else {
                 return dest;
             }
@@ -125,7 +121,7 @@ fn adjust_links<'a>(event: Event<'a>, path: Option<&Path>) -> Event<'a> {
                     .to_str()
                     .expect("utf-8 paths only");
                 if !base.is_empty() {
-                    write!(fixed_link, "{}/", base).unwrap();
+                    write!(fixed_link, "{base}/").unwrap();
                 }
             }
 
@@ -152,10 +148,8 @@ fn adjust_links<'a>(event: Event<'a>, path: Option<&Path>) -> Event<'a> {
         // There are dozens of HTML tags/attributes that contain paths, so
         // feel free to add more tags if desired; these are the only ones I
         // care about right now.
-        lazy_static! {
-            static ref HTML_LINK: Regex =
-                Regex::new(r#"(<(?:a|img) [^>]*?(?:src|href)=")([^"]+?)""#).unwrap();
-        }
+        static HTML_LINK: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r#"(<(?:a|img) [^>]*?(?:src|href)=")([^"]+?)""#).unwrap());
 
         HTML_LINK
             .replace_all(&html, |caps: &regex::Captures<'_>| {
@@ -167,37 +161,59 @@ fn adjust_links<'a>(event: Event<'a>, path: Option<&Path>) -> Event<'a> {
     }
 
     match event {
-        Event::Start(Tag::Link(link_type, dest, title)) => {
-            Event::Start(Tag::Link(link_type, fix(dest, path), title))
-        }
-        Event::Start(Tag::Image(link_type, dest, title)) => {
-            Event::Start(Tag::Image(link_type, fix(dest, path), title))
-        }
+        Event::Start(Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Link {
+            link_type,
+            dest_url: fix(dest_url, path),
+            title,
+            id,
+        }),
+        Event::Start(Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Image {
+            link_type,
+            dest_url: fix(dest_url, path),
+            title,
+            id,
+        }),
         Event::Html(html) => Event::Html(fix_html(html, path)),
+        Event::InlineHtml(html) => Event::InlineHtml(fix_html(html, path)),
         _ => event,
     }
 }
 
 /// Wrapper around the pulldown-cmark parser for rendering markdown to HTML.
-pub fn render_markdown(text: &str, curly_quotes: bool) -> String {
-    render_markdown_with_path(text, curly_quotes, None)
+pub fn render_markdown(text: &str, smart_punctuation: bool) -> String {
+    render_markdown_with_path(text, smart_punctuation, None)
 }
 
-pub fn new_cmark_parser(text: &str, curly_quotes: bool) -> Parser<'_, '_> {
+pub fn new_cmark_parser(text: &str, smart_punctuation: bool) -> Parser<'_> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_FOOTNOTES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
-    if curly_quotes {
+    opts.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+    if smart_punctuation {
         opts.insert(Options::ENABLE_SMART_PUNCTUATION);
     }
     Parser::new_ext(text, opts)
 }
 
-pub fn render_markdown_with_path(text: &str, curly_quotes: bool, path: Option<&Path>) -> String {
+pub fn render_markdown_with_path(
+    text: &str,
+    smart_punctuation: bool,
+    path: Option<&Path>,
+) -> String {
     let mut s = String::with_capacity(text.len() * 3 / 2);
-    let p = new_cmark_parser(text, curly_quotes);
+    let p = new_cmark_parser(text, smart_punctuation);
     let events = p
         .map(clean_codeblock_headers)
         .map(|event| adjust_links(event, path))
@@ -217,7 +233,7 @@ fn wrap_tables(event: Event<'_>) -> (Option<Event<'_>>, Option<Event<'_>>) {
             Some(Event::Html(r#"<div class="table-wrapper">"#.into())),
             Some(event),
         ),
-        Event::End(Tag::Table(_)) => (Some(event), Some(Event::Html(r#"</div>"#.into()))),
+        Event::End(TagEnd::Table) => (Some(event), Some(Event::Html(r#"</div>"#.into()))),
         _ => (Some(event), None),
     }
 }
@@ -249,6 +265,25 @@ pub fn log_backtrace(e: &Error) {
     }
 }
 
+pub(crate) fn special_escape(mut s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    let needs_escape: &[char] = &['<', '>', '\'', '\\', '&'];
+    while let Some(next) = s.find(needs_escape) {
+        escaped.push_str(&s[..next]);
+        match s.as_bytes()[next] {
+            b'<' => escaped.push_str("&lt;"),
+            b'>' => escaped.push_str("&gt;"),
+            b'\'' => escaped.push_str("&#39;"),
+            b'\\' => escaped.push_str("&#92;"),
+            b'&' => escaped.push_str("&amp;"),
+            _ => unreachable!(),
+        }
+        s = &s[next + 1..];
+    }
+    escaped.push_str(s);
+    escaped
+}
+
 pub(crate) fn bracket_escape(mut s: &str) -> String {
     let mut escaped = String::with_capacity(s.len());
     let needs_escape: &[char] = &['<', '>'];
@@ -267,7 +302,7 @@ pub(crate) fn bracket_escape(mut s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::bracket_escape;
+    use super::{bracket_escape, special_escape};
 
     mod render_markdown {
         use super::super::render_markdown;
@@ -490,5 +525,20 @@ more text with spaces
         assert_eq!(bracket_escape("<>"), "&lt;&gt;");
         assert_eq!(bracket_escape("<test>"), "&lt;test&gt;");
         assert_eq!(bracket_escape("a<test>b"), "a&lt;test&gt;b");
+        assert_eq!(bracket_escape("'"), "'");
+        assert_eq!(bracket_escape("\\"), "\\");
+    }
+
+    #[test]
+    fn escaped_special() {
+        assert_eq!(special_escape(""), "");
+        assert_eq!(special_escape("<"), "&lt;");
+        assert_eq!(special_escape(">"), "&gt;");
+        assert_eq!(special_escape("<>"), "&lt;&gt;");
+        assert_eq!(special_escape("<test>"), "&lt;test&gt;");
+        assert_eq!(special_escape("a<test>b"), "a&lt;test&gt;b");
+        assert_eq!(special_escape("'"), "&#39;");
+        assert_eq!(special_escape("\\"), "&#92;");
+        assert_eq!(special_escape("&"), "&amp;");
     }
 }
